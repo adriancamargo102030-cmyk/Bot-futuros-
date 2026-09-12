@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 import requests
 
-# Credenciales privadas desde los Secrets de GitHub
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -30,19 +29,24 @@ def main():
         print("Faltan las credenciales de Telegram en los Secrets.")
         return
 
-    # Inicializar Binance Futures mediante CCXT (evita bloqueos de IP de GitHub)
+    # Inicializar Binance Futures con URL alternativa para evitar el bloqueo de región de GitHub
     exchange = ccxt.binance({
         'options': {
             'defaultType': 'future',
         },
-        'enableRateLimit': True
+        'enableRateLimit': True,
+        'urls': {
+            'api': {
+                'public': 'https://fapi.binance.com/fapi/v1',
+                'private': 'https://fapi.binance.com/fapi/v1',
+            }
+        }
     })
 
     try:
-        print("Cargando mercados de Binance Futures...")
+        print("Cargando mercados de Binance Futures (modo fapi)...")
         exchange.load_markets()
-        # Filtrar solo pares perpetuos de USDT
-        symbols = [symbol for symbol in exchange.symbols if '/USDT:USDT' in symbol or (symbol.endswith('/USDT') and exchange.markets[symbol]['linear'])]
+        symbols = [s for s in exchange.symbols if '/USDT:USDT' in s or (s.endswith('/USDT') and exchange.markets[s]['linear'])]
     except Exception as e:
         print(f"Error al conectar con Binance a través de CCXT: {e}")
         return
@@ -52,24 +56,21 @@ def main():
 
     for symbol in symbols:
         try:
-            # Obtener velas (OHLCV)
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT_CANDLES)
             if not ohlcv or len(ohlcv) < 100:
                 continue
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # Calcular Indicadores Técnicos
+            # Indicadores técnicos
             df['ma99'] = df['close'].rolling(window=99).mean()
             
-            # Cálculo de RSI (14)
             delta = df['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
 
-            # Cálculo de ATR (14)
             high_low = df['high'] - df['low']
             high_close = np.abs(df['high'] - df['close'].shift())
             low_close = np.abs(df['low'] - df['close'].shift())
@@ -86,11 +87,8 @@ def main():
                 continue
 
             direction = None
-            # Tus filtros ajustados:
-            # LONG: Precio > MA99 y RSI <= 45.0
             if current_price > ma99 and rsi <= 45.0:
                 direction = 'LONG'
-            # SHORT: Precio < MA99 y RSI >= 55.0
             elif current_price < ma99 and rsi >= 55.0:
                 direction = 'SHORT'
 
@@ -104,15 +102,14 @@ def main():
                     'atr': atr,
                     'volume': volume
                 })
-        except Exception as err:
-            # Continuar si falla un par individual para que el bot no se detenga
+        except Exception:
             continue
 
     if not potential_signals:
         print("No se encontraron señales en este ciclo.")
         return
 
-    # Ordenar por volumen para seleccionar estrictamente los 5 mejores mercados
+    # Seleccionar los 5 mejores por volumen
     potential_signals = sorted(potential_signals, key=lambda x: x['volume'], reverse=True)
     top_signals = potential_signals[:5]
 
@@ -126,9 +123,7 @@ def main():
         rsi = sig['rsi']
         atr = sig['atr']
         
-        # Limpiar nombre del par para el mensaje (ej. BTC/USDT:USDT -> BTC)
         coin_name = symbol.split('/')[0]
-        
         leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
 
         if direction == 'LONG':
@@ -146,7 +141,6 @@ def main():
             tp2 = current_price - (atr * 1.8)
             tp3 = current_price - (atr * 3.0)
 
-        # Plantilla VIP exacta que pediste
         message = f"""SEÑAL VIP
 ${coin_name} - {direction} {'📈' if direction == 'LONG' else '📉'}
 
@@ -176,8 +170,8 @@ This message was sent automatically with GitHub Actions"""
 
         send_telegram_message(message)
         print(f"Alerta enviada para {coin_name}. Esperando 10 segundos...")
-        time.sleep(10) # Pausa estricta de 10 segundos anti-spam para Telegram
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
-          
+    
