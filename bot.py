@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 import aiohttp
 
-# Credenciales privadas desde los Secrets de GitHub
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -87,14 +86,18 @@ async def main():
         print("Faltan las credenciales de Telegram en los Secrets.")
         return
 
-    # Inicializar exchange con binance.vision de forma asíncrona
+    # Inicializar exchange forzando la API pública exclusivamente a binance.vision
     exchange = ccxt.binance({
         'enableRateLimit': False,
         'timeout': 5000,
-        'options': {'defaultType': 'spot'},
+        'options': {
+            'defaultType': 'spot',
+        },
         'urls': {
             'api': {
                 'public': 'https://data-api.binance.vision/api/v3',
+                'private': 'https://data-api.binance.vision/api/v3',
+                'v3': 'https://data-api.binance.vision/api/v3',
             }
         }
     })
@@ -112,13 +115,12 @@ async def main():
     
     semaphore = asyncio.Semaphore(15)  # Limita a 15 peticiones simultáneas para no saturar la API
     
-    # Creamos las tareas asíncronas aplicando el corte de lista optimizado
+    # Crea las tareas asíncronas y procesa una porción optimizada
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
     resultados = await asyncio.gather(*tasks)
     
     await exchange.close()
 
-    # Filtrar resultados válidos
     potential_signals = [res for res in resultados if res is not None]
 
     if not potential_signals:
@@ -188,8 +190,8 @@ This message was sent automatically with GitHub Actions"""
 
             await send_telegram_message(session, message)
             print(f"Alerta enviada para {coin_name}. Esperando 10 segundos...")
-            await asyncio.sleep(10) # Retraso de 10 segundos anti-spam para Telegram
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+            
