@@ -59,7 +59,6 @@ async def analizar_par(exchange, symbol, semaphore):
                 return None
 
             direction = None
-            # Filtros ajustados:
             # LONG: Precio > MA99 y RSI <= 45.0
             if current_price > ma99 and rsi <= 45.0:
                 direction = 'LONG'
@@ -86,7 +85,6 @@ async def main():
         print("Faltan las credenciales de Telegram en los Secrets.")
         return
 
-    # Inicializar exchange bloqueando por completo cualquier intento de futures (fapi)
     exchange = ccxt.binance({
         'enableRateLimit': False,
         'timeout': 5000,
@@ -103,18 +101,15 @@ async def main():
         }
     })
     
-    # Desactivar explícitamente cualquier mercado que no sea spot
     exchange.has['fetchOHLCV'] = True
     exchange.options['fetchMarkets'] = ['spot']
 
     try:
         print("Cargando mercados Spot de Binance a través de binance.vision (async)...")
-        # Forzar carga exclusiva de spot evitando endpoints de futuros
         markets = await exchange.fetch_markets()
         lista_pares = [m['symbol'] for m in markets if m['quote'] == 'USDT' and m['active']]
         
         if not lista_pares:
-            # Plan de respaldo si fetch_markets viene filtrado
             await exchange.load_markets()
             lista_pares = [s for s in exchange.symbols if s.endswith('/USDT') and not ':' in s and not '-' in s]
 
@@ -123,12 +118,10 @@ async def main():
         await exchange.close()
         return
 
-    print(f"¡Mercados cargados con éxito! Total pares USDT: {len(lista_pares)}")
+    print(f"¡Mercados cargados! Total pares USDT: {len(lista_pares)}")
     print(f"Escaneando mercados de forma concurrente en temporalidad de {TIMEFRAME}...")
     
-    semaphore = asyncio.Semaphore(15)  # Limita a 15 peticiones simultáneas
-    
-    # Crea las tareas asíncronas aplicando el corte de lista optimizado
+    semaphore = asyncio.Semaphore(15)
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
     resultados = await asyncio.gather(*tasks)
     
@@ -140,71 +133,100 @@ async def main():
         print("No se encontraron señales en este ciclo.")
         return
 
-    # Ordenar por volumen y seleccionar estrictamente los 5 mejores mercados
+    # REGLA NUEVA: Ordenar por volumen y seleccionar estrictamente LA MEJOR (1 sola opción por hora)
     potential_signals = sorted(potential_signals, key=lambda x: x['volume'], reverse=True)
-    top_signals = potential_signals[:5]
+    best_signal = potential_signals[0]
 
-    print(f"Se seleccionaron los {len(top_signals)} mejores pares. Enviando alertas...")
+    print(f"Se seleccionó la mejor opción: {best_signal['symbol']}. Enviando alerta única...")
 
     async with aiohttp.ClientSession() as session:
-        for sig in top_signals:
-            symbol = sig['symbol']
-            direction = sig['direction']
-            current_price = sig['current_price']
-            ma99 = sig['ma99']
-            rsi = sig['rsi']
-            atr = sig['atr']
-            
-            coin_name = symbol.split('/')[0]
-            leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
+        sig = best_signal
+        symbol = sig['symbol']
+        direction = sig['direction']
+        current_price = sig['current_price']
+        ma99 = sig['ma99']
+        rsi = sig['rsi']
+        atr = sig['atr']
+        
+        coin_name = symbol.split('/')[0]
+        
+        # Formato visual de Compra/Venta con color
+        if direction == 'LONG':
+            action_label = "LONG - COMPRA 🟢"
+        else:
+            action_label = "SHORT - VENTA 🔴"
 
-            if direction == 'LONG':
-                entry_min = current_price - (atr * 0.2)
-                entry_max = current_price
-                sl = current_price - (atr * 1.5)
-                tp1 = current_price + (atr * 1.0)
-                tp2 = current_price + (atr * 1.8)
-                tp3 = current_price + (atr * 3.0)
-            else:
-                entry_min = current_price
-                entry_max = current_price + (atr * 0.2)
-                sl = current_price + (atr * 1.5)
-                tp1 = current_price - (atr * 1.0)
-                tp2 = current_price - (atr * 1.8)
-                tp3 = current_price - (atr * 3.0)
+        # Blindaje ATR
+        min_atr = current_price * 0.005
+        if atr < min_atr:
+            atr = min_atr
 
-            # Plantilla VIP exacta
-            message = f"""SEÑAL VIP
-${coin_name} - {direction} {'📈' if direction == 'LONG' else '📉'}
+        # Decimales dinámicos
+        if current_price < 0.01:
+            decimals = 6
+        elif current_price < 1.0:
+            decimals = 4
+        else:
+            decimals = 2
+
+        fmt = f"{{:.{decimals}f}}"
+
+        leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
+
+        if direction == 'LONG':
+            entry_min = current_price - (atr * 0.2)
+            entry_max = current_price
+            sl = current_price - (atr * 1.5)
+            tp1 = current_price + (atr * 1.0)
+            tp2 = current_price + (atr * 1.8)
+            tp3 = current_price + (atr * 3.0)
+        else:
+            entry_min = current_price
+            entry_max = current_price + (atr * 0.2)
+            sl = current_price + (atr * 1.5)
+            tp1 = current_price - (atr * 1.0)
+            tp2 = current_price - (atr * 1.8)
+            tp3 = current_price - (atr * 3.0)
+
+        s_entry_min = fmt.format(entry_min)
+        s_entry_max = fmt.format(entry_max)
+        s_sl = fmt.format(sl)
+        s_tp1 = fmt.format(tp1)
+        s_tp2 = fmt.format(tp2)
+        s_tp3 = fmt.format(tp3)
+        s_ma99 = fmt.format(ma99)
+        s_atr = fmt.format(atr)
+
+        message = f"""SEÑAL VIP
+${coin_name} - {action_label}
 
 Plan de Comercio:
-• Entrada: {entry_min:.4f} – {entry_max:.4f}
-• Stop Loss: {sl:.4f}
+• Entrada: {s_entry_min} – {s_entry_max}
+• Stop Loss: {s_sl}
 
 Take Profits:
-• TP1: {tp1:.4f}
-• TP2: {tp2:.4f}
-• TP3: {tp3:.4f}
+• TP1: {s_tp1}
+• TP2: {s_tp2}
+• TP3: {s_tp3}
 
 Apalancamiento sugerido: {leverage}
 
 Justificación:
-La estructura de 1h mantiene un sesgo claramente {'alcista' if direction == 'LONG' else 'bajista'}, con el precio operando por {'encima' if direction == 'LONG' else 'debajo'} de la MA99 ({ma99:.4f}), lo que valida la tendencia de fondo y respalda la continuidad del movimiento.
+La estructura de 1h mantiene un sesgo claramente {'alcista' if direction == 'LONG' else 'bajista'}, con el precio operando por {'encima' if direction == 'LONG' else 'debajo'} de la MA99 ({s_ma99}), lo que valida la tendencia de fondo y respalda la continuidad del movimiento.
 El RSI en 1h (~{rsi:.1f}) se encuentra en zona operativa óptima para retrocesos, lo que deja margen para una nueva extensión antes de encontrar resistencia fuerte.
-La zona de entrada entre {entry_min:.4f} y {entry_max:.4f} ofrece una relación riesgo/beneficio favorable con Stop Loss bien definido en {sl:.4f}.
-La volatilidad medida por el ATR (~{atr:.4f}) muestra un mercado activo en 1h, aumentando las probabilidades de éxito.
-TP1 busca capturar el primer movimiento hacia {tp1:.4f}, mientras que TP2 y TP3 apuntan a una extensión hacia {tp2:.4f} y {tp3:.4f}.
+La zona de entrada entre {s_entry_min} y {s_entry_max} ofrece una relación riesgo/beneficio favorable con Stop Loss bien definido en {s_sl}.
+La volatilidad medida por el ATR (~{s_atr}) muestra un mercado activo en 1h, aumentando las probabilidades de éxito.
+TP1 busca capturar el primer movimiento hacia {s_tp1}, mientras que TP2 y TP3 apuntan a una extensión hacia {s_tp2} y {s_tp3}.
 
-⚠️ Mientras el precio permanezca por {'encima' if direction == 'LONG' else 'debajo'} de {sl:.4f}, el escenario {direction} continúa siendo válido.
+⚠️ Mientras el precio permanezca por {'encima' if direction == 'LONG' else 'debajo'} de {s_sl}, el escenario {direction} continúa siendo válido.
 
 Sesgo: {'Alcista con potencial de continuidad si se mantiene el soporte.' if direction == 'LONG' else 'Bajista con potencial de continuidad si se mantiene la resistencia.'}
 
 This message was sent automatically with GitHub Actions"""
 
-            await send_telegram_message(session, message)
-            print(f"Alerta enviada para {coin_name}. Esperando 10 segundos...")
-            await asyncio.sleep(10)
+        await send_telegram_message(session, message)
+        print(f"¡Alerta única enviada para {coin_name}!")
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+            
