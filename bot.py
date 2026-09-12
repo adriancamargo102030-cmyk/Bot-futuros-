@@ -86,36 +86,47 @@ async def main():
         print("Faltan las credenciales de Telegram en los Secrets.")
         return
 
-    # Inicializar exchange con binance.vision exclusivo para spot
+    # Inicializar exchange bloqueando por completo cualquier intento de futures (fapi)
     exchange = ccxt.binance({
         'enableRateLimit': False,
         'timeout': 5000,
         'options': {
             'defaultType': 'spot',
+            'adjustForTimeDifference': True
         },
         'urls': {
             'api': {
                 'public': 'https://data-api.binance.vision/api/v3',
+                'private': 'https://data-api.binance.vision/api/v3',
+                'v3': 'https://data-api.binance.vision/api/v3',
             }
         }
     })
     
-    # Evitar que CCXT intente consultar endpoints de futuros bloqueados
-    exchange.has['swap'] = False
-    exchange.has['future'] = False
+    # Desactivar explícitamente cualquier mercado que no sea spot
+    exchange.has['fetchOHLCV'] = True
+    exchange.options['fetchMarkets'] = ['spot']
 
     try:
-        print("Cargando mercados de Binance a través de binance.vision (async)...")
-        await exchange.load_markets()
-        lista_pares = [s for s in exchange.symbols if s.endswith('/USDT') and not ':' in s]
+        print("Cargando mercados Spot de Binance a través de binance.vision (async)...")
+        # Forzar carga exclusiva de spot evitando endpoints de futuros
+        markets = await exchange.fetch_markets()
+        lista_pares = [m['symbol'] for m in markets if m['quote'] == 'USDT' and m['active']]
+        
+        if not lista_pares:
+            # Plan de respaldo si fetch_markets viene filtrado
+            await exchange.load_markets()
+            lista_pares = [s for s in exchange.symbols if s.endswith('/USDT') and not ':' in s and not '-' in s]
+
     except Exception as e:
-        print(f"Error al conectar con Binance: {e}")
+        print(f"Error al conectar con Binance Spot: {e}")
         await exchange.close()
         return
 
+    print(f"¡Mercados cargados con éxito! Total pares USDT: {len(lista_pares)}")
     print(f"Escaneando mercados de forma concurrente en temporalidad de {TIMEFRAME}...")
     
-    semaphore = asyncio.Semaphore(15)  # Limita a 15 peticiones simultáneas para no saturar la API
+    semaphore = asyncio.Semaphore(15)  # Limita a 15 peticiones simultáneas
     
     # Crea las tareas asíncronas aplicando el corte de lista optimizado
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
