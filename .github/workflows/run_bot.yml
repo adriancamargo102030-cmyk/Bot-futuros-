@@ -2,8 +2,8 @@ name: Binance Futures Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # Corre cada hora en punto
-  workflow_dispatch: # Permite probarlo de forma manual desde GitHub
+    - cron: '0 * * * *' # Se ejecuta exactamente una vez por hora, al minuto 0
+  workflow_dispatch:      # Permite activarlo manualmente desde la pestaña Actions en GitHub
 
 jobs:
   run-bot:
