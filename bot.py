@@ -86,7 +86,7 @@ async def main():
         print("Faltan las credenciales de Telegram en los Secrets.")
         return
 
-    # Inicializar exchange forzando la API pública exclusivamente a binance.vision
+    # Inicializar exchange con binance.vision exclusivo para spot
     exchange = ccxt.binance({
         'enableRateLimit': False,
         'timeout': 5000,
@@ -96,11 +96,13 @@ async def main():
         'urls': {
             'api': {
                 'public': 'https://data-api.binance.vision/api/v3',
-                'private': 'https://data-api.binance.vision/api/v3',
-                'v3': 'https://data-api.binance.vision/api/v3',
             }
         }
     })
+    
+    # Evitar que CCXT intente consultar endpoints de futuros bloqueados
+    exchange.has['swap'] = False
+    exchange.has['future'] = False
 
     try:
         print("Cargando mercados de Binance a través de binance.vision (async)...")
@@ -115,7 +117,7 @@ async def main():
     
     semaphore = asyncio.Semaphore(15)  # Limita a 15 peticiones simultáneas para no saturar la API
     
-    # Crea las tareas asíncronas y procesa una porción optimizada
+    # Crea las tareas asíncronas aplicando el corte de lista optimizado
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
     resultados = await asyncio.gather(*tasks)
     
@@ -194,4 +196,4 @@ This message was sent automatically with GitHub Actions"""
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
