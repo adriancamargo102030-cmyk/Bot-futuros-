@@ -1,9 +1,10 @@
 import os
 import time
-import ccxt
+import asyncio
+import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-import requests
+import aiohttp
 
 # Credenciales privadas desde los Secrets de GitHub
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -12,7 +13,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAME = '1h'
 LIMIT_CANDLES = 120
 
-def send_telegram_message(message):
+async def send_telegram_message(session, message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -20,59 +21,29 @@ def send_telegram_message(message):
         "parse_mode": "Markdown"
     }
     try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
+        async with session.post(url, json=payload) as response:
+            await response.text()
     except Exception as e:
         print(f"Error al enviar mensaje a Telegram: {e}")
 
-def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Faltan las credenciales de Telegram en los Secrets.")
-        return
-
-    # Conexión configurada con la API pública de binance.vision para evitar el bloqueo 451 en GitHub Actions
-    exchange = ccxt.binance({
-        'enableRateLimit': False,
-        'timeout': 5000,
-        'options': {'defaultType': 'spot'},
-        'urls': {
-            'api': {
-                'public': 'https://data-api.binance.vision/api/v3',
-            }
-        }
-    })
-
-    try:
-        print("Cargando mercados de Binance a través de binance.vision...")
-        exchange.load_markets()
-        # Filtrar pares contra USDT
-        symbols = [s for s in exchange.symbols if s.endswith('/USDT') and not ':' in s]
-    except Exception as e:
-        print(f"Error al conectar con Binance a través de CCXT: {e}")
-        return
-
-    print(f"Escaneando {len(symbols)} pares en temporalidad de {TIMEFRAME}...")
-    potential_signals = []
-
-    for symbol in symbols:
+async def analizar_par(exchange, symbol, semaphore):
+    async with semaphore:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT_CANDLES)
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT_CANDLES)
             if not ohlcv or len(ohlcv) < 100:
-                continue
+                return None
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
             # Indicadores Técnicos
             df['ma99'] = df['close'].rolling(window=99).mean()
             
-            # Cálculo de RSI (14)
             delta = df['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
 
-            # Cálculo de ATR (14)
             high_low = df['high'] - df['low']
             high_close = np.abs(df['high'] - df['close'].shift())
             low_close = np.abs(df['low'] - df['close'].shift())
@@ -86,10 +57,10 @@ def main():
             volume = df['volume'].iloc[-1]
 
             if pd.isna(ma99) or pd.isna(rsi) or pd.isna(atr):
-                continue
+                return None
 
             direction = None
-            # Filtros ajustados solicitados:
+            # Filtros ajustados:
             # LONG: Precio > MA99 y RSI <= 45.0
             if current_price > ma99 and rsi <= 45.0:
                 direction = 'LONG'
@@ -98,7 +69,7 @@ def main():
                 direction = 'SHORT'
 
             if direction:
-                potential_signals.append({
+                return {
                     'symbol': symbol,
                     'direction': direction,
                     'current_price': current_price,
@@ -106,9 +77,49 @@ def main():
                     'rsi': rsi,
                     'atr': atr,
                     'volume': volume
-                })
+                }
         except Exception:
-            continue
+            return None
+        return None
+
+async def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Faltan las credenciales de Telegram en los Secrets.")
+        return
+
+    # Inicializar exchange con binance.vision de forma asíncrona
+    exchange = ccxt.binance({
+        'enableRateLimit': False,
+        'timeout': 5000,
+        'options': {'defaultType': 'spot'},
+        'urls': {
+            'api': {
+                'public': 'https://data-api.binance.vision/api/v3',
+            }
+        }
+    })
+
+    try:
+        print("Cargando mercados de Binance a través de binance.vision (async)...")
+        await exchange.load_markets()
+        lista_pares = [s for s in exchange.symbols if s.endswith('/USDT') and not ':' in s]
+    except Exception as e:
+        print(f"Error al conectar con Binance: {e}")
+        await exchange.close()
+        return
+
+    print(f"Escaneando mercados de forma concurrente en temporalidad de {TIMEFRAME}...")
+    
+    semaphore = asyncio.Semaphore(15)  # Limita a 15 peticiones simultáneas para no saturar la API
+    
+    # Creamos las tareas asíncronas aplicando el corte de lista optimizado
+    tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
+    resultados = await asyncio.gather(*tasks)
+    
+    await exchange.close()
+
+    # Filtrar resultados válidos
+    potential_signals = [res for res in resultados if res is not None]
 
     if not potential_signals:
         print("No se encontraron señales en este ciclo.")
@@ -120,34 +131,35 @@ def main():
 
     print(f"Se seleccionaron los {len(top_signals)} mejores pares. Enviando alertas...")
 
-    for sig in top_signals:
-        symbol = sig['symbol']
-        direction = sig['direction']
-        current_price = sig['current_price']
-        ma99 = sig['ma99']
-        rsi = sig['rsi']
-        atr = sig['atr']
-        
-        coin_name = symbol.split('/')[0]
-        leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
+    async with aiohttp.ClientSession() as session:
+        for sig in top_signals:
+            symbol = sig['symbol']
+            direction = sig['direction']
+            current_price = sig['current_price']
+            ma99 = sig['ma99']
+            rsi = sig['rsi']
+            atr = sig['atr']
+            
+            coin_name = symbol.split('/')[0]
+            leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
 
-        if direction == 'LONG':
-            entry_min = current_price - (atr * 0.2)
-            entry_max = current_price
-            sl = current_price - (atr * 1.5)
-            tp1 = current_price + (atr * 1.0)
-            tp2 = current_price + (atr * 1.8)
-            tp3 = current_price + (atr * 3.0)
-        else:
-            entry_min = current_price
-            entry_max = current_price + (atr * 0.2)
-            sl = current_price + (atr * 1.5)
-            tp1 = current_price - (atr * 1.0)
-            tp2 = current_price - (atr * 1.8)
-            tp3 = current_price - (atr * 3.0)
+            if direction == 'LONG':
+                entry_min = current_price - (atr * 0.2)
+                entry_max = current_price
+                sl = current_price - (atr * 1.5)
+                tp1 = current_price + (atr * 1.0)
+                tp2 = current_price + (atr * 1.8)
+                tp3 = current_price + (atr * 3.0)
+            else:
+                entry_min = current_price
+                entry_max = current_price + (atr * 0.2)
+                sl = current_price + (atr * 1.5)
+                tp1 = current_price - (atr * 1.0)
+                tp2 = current_price - (atr * 1.8)
+                tp3 = current_price - (atr * 3.0)
 
-        # Plantilla VIP exacta
-        message = f"""SEÑAL VIP
+            # Plantilla VIP exacta
+            message = f"""SEÑAL VIP
 ${coin_name} - {direction} {'📈' if direction == 'LONG' else '📉'}
 
 Plan de Comercio:
@@ -174,10 +186,10 @@ Sesgo: {'Alcista con potencial de continuidad si se mantiene el soporte.' if dir
 
 This message was sent automatically with GitHub Actions"""
 
-        send_telegram_message(message)
-        print(f"Alerta enviada para {coin_name}. Esperando 10 segundos...")
-        time.sleep(10) # Retraso de 10 segundos anti-spam para Telegram
+            await send_telegram_message(session, message)
+            print(f"Alerta enviada para {coin_name}. Esperando 10 segundos...")
+            await asyncio.sleep(10) # Retraso de 10 segundos anti-spam para Telegram
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
     
