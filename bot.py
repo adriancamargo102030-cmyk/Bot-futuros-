@@ -53,6 +53,29 @@ async def send_telegram_message(session, message):
     except Exception as e:
         print(f"Error al enviar mensaje a Telegram: {e}")
 
+def calcular_adx(df, period=14):
+    df['h-l'] = df['high'] - df['low']
+    df['h-pc'] = abs(df['high'] - df['close'].shift(1))
+    df['l-pc'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    
+    df['up_move'] = df['high'] - df['high'].shift(1)
+    df['down_move'] = df['low'].shift(1) - df['low']
+    
+    df['pdm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
+    df['mdm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    
+    df['tr14'] = df['tr'].rolling(window=period).sum()
+    df['pdm14'] = df['pdm'].rolling(window=period).sum()
+    df['mdm14'] = df['mdm'].rolling(window=period).sum()
+    
+    df['pdi'] = 100 * (df['pdm14'] / df['tr14'])
+    df['mdi'] = 100 * (df['mdm14'] / df['tr14'])
+    
+    df['dx'] = 100 * abs(df['pdi'] - df['mdi']) / (df['pdi'] + df['mdi'])
+    df['adx'] = df['dx'].rolling(window=period).mean()
+    return df['adx']
+
 async def analizar_par(exchange, symbol, semaphore):
     async with semaphore:
         try:
@@ -62,7 +85,7 @@ async def analizar_par(exchange, symbol, semaphore):
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # --- INDICADORES DE ALTA EFECTIVIDAD (MA99 + EMA20 + EMA50 + RSI + ATR) ---
+            # --- INDICADORES DE TENDENCIA Y FUERZA REAL ---
             df['ma99'] = df['close'].rolling(window=99).mean()
             df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
             df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -79,22 +102,31 @@ async def analizar_par(exchange, symbol, semaphore):
             tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
             df['atr'] = tr.rolling(window=14).mean()
 
+            # Cálculo de ADX para evitar mercados laterales/sin fuerza
+            df['adx'] = calcular_adx(df)
+            
+            # Filtro de volumen promedio
+            df['vol_ma'] = df['volume'].rolling(window=20).mean()
+
             current_price = df['close'].iloc[-1]
             ma99 = df['ma99'].iloc[-1]
             ema20 = df['ema20'].iloc[-1]
             ema50 = df['ema50'].iloc[-1]
             rsi = df['rsi'].iloc[-1]
             atr = df['atr'].iloc[-1]
+            adx = df['adx'].iloc[-1]
             volume = df['volume'].iloc[-1]
+            vol_ma = df['vol_ma'].iloc[-1]
 
-            if pd.isna(ma99) or pd.isna(ema20) or pd.isna(ema50) or pd.isna(rsi) or pd.isna(atr):
+            if pd.isna(ma99) or pd.isna(ema20) or pd.isna(ema50) or pd.isna(rsi) or pd.isna(atr) or pd.isna(adx):
                 return None
 
             direction = None
-            # Filtros estrictos para asegurar alta probabilidad en movimientos rápidos (LONG y SHORT)
-            if current_price > ma99 and ema20 > ema50 and rsi <= 43.0:
+            
+            # FILTROS ESTRICTOS: Exigimos ADX > 22 (fuerza de tendencia) y volumen superior a la media
+            if current_price > ma99 and ema20 > ema50 and rsi <= 43.0 and adx > 22.0 and volume > vol_ma:
                 direction = 'LONG'
-            elif current_price < ma99 and ema20 < ema50 and rsi >= 57.0:
+            elif current_price < ma99 and ema20 < ema50 and rsi >= 57.0 and adx > 22.0 and volume > vol_ma:
                 direction = 'SHORT'
 
             if direction:
@@ -105,6 +137,7 @@ async def analizar_par(exchange, symbol, semaphore):
                     'ma99': ma99,
                     'rsi': rsi,
                     'atr': atr,
+                    'adx': adx,
                     'volume': volume
                 }
         except Exception:
@@ -150,7 +183,7 @@ async def main():
         return
 
     print(f"¡Mercados cargados! Total pares USDT: {len(lista_pares)}")
-    print(f"Escaneando mercados con filtros de alta efectividad en {TIMEFRAME}...")
+    print(f"Escaneando mercados con filtro de fuerza ADX y volumen en {TIMEFRAME}...")
     
     semaphore = asyncio.Semaphore(15)
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
@@ -161,7 +194,7 @@ async def main():
     potential_signals = [res for res in resultados if res is not None]
 
     if not potential_signals:
-        print("No se encontraron señales de alta calidad en este ciclo.")
+        print("No se encontraron señales con fuerza institucional en este ciclo.")
         return
 
     # --- APLICACIÓN DEL COOLDOWN PERSISTENTE ---
@@ -182,11 +215,9 @@ async def main():
         print("Hay señales pero todas están en período de Cooldown activo.")
         return
 
-    # Ordenar por volumen de negociación para elegir siempre la opción más líquida y fuerte
     pares_filtrados = sorted(pares_filtrados, key=lambda x: x['volume'], reverse=True)
     best_signal = pares_filtrados[0]
 
-    # Guardar en historial y sincronizar con git
     historial[best_signal['symbol']] = ahora.isoformat()
     guardar_historial_y_sincronizar(historial)
 
@@ -200,6 +231,7 @@ async def main():
         ma99 = sig['ma99']
         rsi = sig['rsi']
         atr = sig['atr']
+        adx = sig['adx']
         
         coin_name = symbol.split('/')[0]
         
@@ -224,18 +256,18 @@ async def main():
         fmt = f"{{:.{decimals}f}}"
         leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
 
-        # --- TPs Y SL AMPLIADOS PARA MAYOR RECORRIDO Y GANANCIA ---
+        # --- GESTIÓN DE RIESGO OPTIMIZADA PARA EVITAR FALSOS SL ---
         if direction == 'LONG':
             entry_min = current_price - (atr * 0.3)
             entry_max = current_price
-            sl = current_price - (atr * 2.0)
-            tp1 = current_price + (atr * 2.5)
+            sl = current_price - (atr * 2.2)     # SL más holgado para resistir retrocesos normales
+            tp1 = current_price + (atr * 2.5)    # TP óptimos para capturar el impulso real
             tp2 = current_price + (atr * 4.5)
             tp3 = current_price + (atr * 7.0)
         else:
             entry_min = current_price
             entry_max = current_price + (atr * 0.3)
-            sl = current_price + (atr * 2.0)
+            sl = current_price + (atr * 2.2)
             tp1 = current_price - (atr * 2.5)
             tp2 = current_price - (atr * 4.5)
             tp3 = current_price - (atr * 7.0)
@@ -264,20 +296,20 @@ Take Profits:
 Apalancamiento sugerido: {leverage}
 
 Justificación:
-La estructura de 1h mantiene un sesgo de alta probabilidad {'alcista' if direction == 'LONG' else 'bajista'}, respaldado por la alineación institucional de la MA99 ({s_ma99}) y las EMAs rápidas, asegurando un impulso dinámico.
-El RSI en 1h (~{rsi:.1f}) marca un punto de entrada óptimo tras un retroceso sano, propicio para capturar el movimiento amplio.
-La zona de entrada entre {s_entry_min} y {s_entry_max} optimiza el riesgo/beneficio con un Stop Loss técnico en {s_sl}.
-La volatilidad del ATR (~{s_atr}) confirma el rango necesario para buscar los objetivos extendidos.
+La estructura de 1h muestra una tendencia sólida con fuerza institucional (ADX ~{adx:.1f}), respaldada por la MA99 ({s_ma99}) y el alineamiento de EMAs.
+El RSI en 1h (~{rsi:.1f}) confirma un retroceso estructural finalizado dentro de un mercado con volumen de negociación activo.
+La zona de entrada entre {s_entry_min} y {s_entry_max} cuenta con un Stop Loss optimizado en {s_sl} para evitar barridas de ruido.
+La volatilidad del ATR (~{s_atr}) respalda el alcance de los objetivos propuestos.
 
 ⚠️ Mantener estricta disciplina en {s_sl}.
 
-Sesgo: {'Continuidad alcista ampliada.' if direction == 'LONG' else 'Continuidad bajista ampliada.'}
+Sesgo: {'Tendencia alcista confirmada por fuerza institucional.' if direction == 'LONG' else 'Tendencia bajista confirmada por fuerza institucional.'}
 
 This message was sent automatically with GitHub Actions"""
 
         await send_telegram_message(session, message)
-        print(f"¡Alerta ampliada enviada para {coin_name}!")
+        print(f"¡Alerta con filtro de fuerza enviada para {coin_name}!")
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+            
