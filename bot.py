@@ -1,4 +1,5 @@
 import os
+import subprocess
 import time
 import asyncio
 import json
@@ -13,7 +14,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = '1h'
 LIMIT_CANDLES = 120
-COOLDOWN_HOURS = 4  # Horas que una moneda debe esperar antes de recibir otra señal
+COOLDOWN_HOURS = 6  # 6 horas de descanso por cada moneda para evitar repeticiones
 HISTORIAL_FILE = "historial_senales.json"
 
 def cargar_historial():
@@ -25,12 +26,19 @@ def cargar_historial():
             return {}
     return {}
 
-def guardar_historial(historial):
+def guardar_historial_y_sincronizar(historial):
     try:
         with open(HISTORIAL_FILE, "w") as f:
             json.dump(historial, f, indent=4)
+        
+        # Sincronización automática con GitHub para que el Cooldown persista entre ejecuciones horarias
+        subprocess.run(["git", "config", "--global", "user.name", "Bot Signal"], check=False)
+        subprocess.run(["git", "config", "--global", "user.email", "bot@actions.local"], check=False)
+        subprocess.run(["git", "add", HISTORIAL_FILE], check=False)
+        subprocess.run(["git", "commit", "-m", "Actualizar historial de cooldown [skip ci]"], check=False)
+        subprocess.run(["git", "push"], check=False)
     except Exception as e:
-        print(f"Error al guardar el historial: {e}")
+        print(f"Error al sincronizar historial con Git: {e}")
 
 async def send_telegram_message(session, message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -54,8 +62,10 @@ async def analizar_par(exchange, symbol, semaphore):
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # Indicadores Técnicos
+            # --- INDICADORES DE ALTA EFECTIVIDAD (MA99 + EMA20 + EMA50 + RSI + ATR) ---
             df['ma99'] = df['close'].rolling(window=99).mean()
+            df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+            df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
             
             delta = df['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -71,17 +81,20 @@ async def analizar_par(exchange, symbol, semaphore):
 
             current_price = df['close'].iloc[-1]
             ma99 = df['ma99'].iloc[-1]
+            ema20 = df['ema20'].iloc[-1]
+            ema50 = df['ema50'].iloc[-1]
             rsi = df['rsi'].iloc[-1]
             atr = df['atr'].iloc[-1]
             volume = df['volume'].iloc[-1]
 
-            if pd.isna(ma99) or pd.isna(rsi) or pd.isna(atr):
+            if pd.isna(ma99) or pd.isna(ema20) or pd.isna(ema50) or pd.isna(rsi) or pd.isna(atr):
                 return None
 
             direction = None
-            if current_price > ma99 and rsi <= 45.0:
+            # Filtros estrictos para asegurar alta probabilidad en movimientos rápidos (1h - a pocas horas)
+            if current_price > ma99 and ema20 > ema50 and rsi <= 43.0:
                 direction = 'LONG'
-            elif current_price < ma99 and rsi >= 55.0:
+            elif current_price < ma99 and ema20 < ema50 and rsi >= 57.0:
                 direction = 'SHORT'
 
             if direction:
@@ -137,7 +150,7 @@ async def main():
         return
 
     print(f"¡Mercados cargados! Total pares USDT: {len(lista_pares)}")
-    print(f"Escaneando mercados en temporalidad de {TIMEFRAME}...")
+    print(f"Escaneando mercados con filtros de alta efectividad en {TIMEFRAME}...")
     
     semaphore = asyncio.Semaphore(15)
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
@@ -148,36 +161,34 @@ async def main():
     potential_signals = [res for res in resultados if res is not None]
 
     if not potential_signals:
-        print("No se encontraron señales en este ciclo.")
+        print("No se encontraron señales de alta calidad en este ciclo.")
         return
 
-    # --- FILTRO DE COOLDOWN ---
+    # --- APLICACIÓN DEL COOLDOWN PERSISTENTE ---
     historial = cargar_historial()
     ahora = datetime.now(timezone.utc)
     
-    # Limpiar monedas expiradas del historial y filtrar las que estén en cooldown
     pares_filtrados = []
     for sig in potential_signals:
         sym = sig['symbol']
         if sym in historial:
             tiempo_ultima = datetime.fromisoformat(historial[sym])
-            # Si aún está dentro de las 4 horas de descanso, se omite
             if ahora - tiempo_ultima < timedelta(hours=COOLDOWN_HOURS):
-                print(f"Moneda {sym} en Cooldown (ignorada temporalmente).")
+                print(f"Moneda {sym} en Cooldown (ignorada).")
                 continue
         pares_filtrados.append(sig)
 
     if not pares_filtrados:
-        print("Hay señales pero todas están en período de Cooldown.")
+        print("Hay señales pero todas están en período de Cooldown activo.")
         return
 
-    # Ordenar por volumen de los pares que sí pasaron el cooldown
+    # Ordenar por volumen de negociación para elegir siempre la opción más líquida y fuerte
     pares_filtrados = sorted(pares_filtrados, key=lambda x: x['volume'], reverse=True)
     best_signal = pares_filtrados[0]
 
-    # Registrar esta moneda en el historial con la hora actual
+    # Guardar en historial y sincronizar con git
     historial[best_signal['symbol']] = ahora.isoformat()
-    guardar_historial(historial)
+    guardar_historial_y_sincronizar(historial)
 
     print(f"Se seleccionó la mejor opción fuera de cooldown: {best_signal['symbol']}. Enviando alerta...")
 
@@ -252,21 +263,20 @@ Take Profits:
 Apalancamiento sugerido: {leverage}
 
 Justificación:
-La estructura de 1h mantiene un sesgo claramente {'alcista' if direction == 'LONG' else 'bajista'}, con el precio operando por {'encima' if direction == 'LONG' else 'debajo'} de la MA99 ({s_ma99}), lo que valida la tendencia de fondo y respalda la continuidad del movimiento.
-El RSI en 1h (~{rsi:.1f}) se encuentra en zona operativa óptima para retrocesos, lo que deja margen para una nueva extensión antes de encontrar resistencia fuerte.
-La zona de entrada entre {s_entry_min} y {s_entry_max} ofrece una relación riesgo/beneficio favorable con Stop Loss bien definido en {s_sl}.
-La volatilidad medida por el ATR (~{s_atr}) muestra un mercado activo en 1h, aumentando las probabilidades de éxito.
-TP1 busca capturar el primer movimiento hacia {s_tp1}, mientras que TP2 y TP3 apuntan a una extensión hacia {s_tp2} y {s_tp3}.
+La estructura de 1h mantiene un sesgo de alta probabilidad {'alcista' if direction == 'LONG' else 'bajista'}, respaldado por la alineación institucional de la MA99 ({s_ma99}) y las EMAs rápidas, asegurando un impulso dinámico a corto plazo.
+El RSI en 1h (~{rsi:.1f}) marca un punto de entrada óptimo tras un retroceso sano, propicio para resolverse en las próximas horas.
+La zona de entrada entre {s_entry_min} y {s_entry_max} optimiza el riesgo/beneficio con un Stop Loss técnico en {s_sl}.
+La volatilidad del ATR (~{s_atr}) confirma actividad ideal para capturar TP1 rápidamente.
 
-⚠️ Mientras el precio permanezca por {'encima' if direction == 'LONG' else 'debajo'} de {s_sl}, el escenario {direction} continúa siendo válido.
+⚠️ Mantener estricta disciplina en {s_sl}.
 
-Sesgo: {'Alcista con potencial de continuidad si se mantiene el soporte.' if direction == 'LONG' else 'Bajista con potencial de continuidad si se mantiene la resistencia.'}
+Sesgo: {'Continuidad alcista de corto plazo.' if direction == 'LONG' else 'Continuidad bajista de corto plazo.'}
 
 This message was sent automatically with GitHub Actions"""
 
         await send_telegram_message(session, message)
-        print(f"¡Alerta única enviada para {coin_name}!")
+        print(f"¡Alerta de alta efectividad enviada para {coin_name}!")
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
