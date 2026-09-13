@@ -91,7 +91,7 @@ async def analizar_par(exchange, symbol, semaphore):
                 return None
 
             direction = None
-            # Filtros estrictos para asegurar alta probabilidad en movimientos rápidos (1h - a pocas horas)
+            # Filtros estrictos para asegurar alta probabilidad en movimientos rápidos (LONG y SHORT)
             if current_price > ma99 and ema20 > ema50 and rsi <= 43.0:
                 direction = 'LONG'
             elif current_price < ma99 and ema20 < ema50 and rsi >= 57.0:
@@ -224,20 +224,21 @@ async def main():
         fmt = f"{{:.{decimals}f}}"
         leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
 
+        # --- TPs Y SL AMPLIADOS PARA MAYOR RECORRIDO Y GANANCIA ---
         if direction == 'LONG':
-            entry_min = current_price - (atr * 0.2)
+            entry_min = current_price - (atr * 0.3)
             entry_max = current_price
-            sl = current_price - (atr * 1.5)
-            tp1 = current_price + (atr * 1.0)
-            tp2 = current_price + (atr * 1.8)
-            tp3 = current_price + (atr * 3.0)
+            sl = current_price - (atr * 2.0)
+            tp1 = current_price + (atr * 2.5)
+            tp2 = current_price + (atr * 4.5)
+            tp3 = current_price + (atr * 7.0)
         else:
             entry_min = current_price
-            entry_max = current_price + (atr * 0.2)
-            sl = current_price + (atr * 1.5)
-            tp1 = current_price - (atr * 1.0)
-            tp2 = current_price - (atr * 1.8)
-            tp3 = current_price - (atr * 3.0)
+            entry_max = current_price + (atr * 0.3)
+            sl = current_price + (atr * 2.0)
+            tp1 = current_price - (atr * 2.5)
+            tp2 = current_price - (atr * 4.5)
+            tp3 = current_price - (atr * 7.0)
 
         s_entry_min = fmt.format(entry_min)
         s_entry_max = fmt.format(entry_max)
@@ -263,20 +264,20 @@ Take Profits:
 Apalancamiento sugerido: {leverage}
 
 Justificación:
-La estructura de 1h mantiene un sesgo de alta probabilidad {'alcista' if direction == 'LONG' else 'bajista'}, respaldado por la alineación institucional de la MA99 ({s_ma99}) y las EMAs rápidas, asegurando un impulso dinámico a corto plazo.
-El RSI en 1h (~{rsi:.1f}) marca un punto de entrada óptimo tras un retroceso sano, propicio para resolverse en las próximas horas.
+La estructura de 1h mantiene un sesgo de alta probabilidad {'alcista' if direction == 'LONG' else 'bajista'}, respaldado por la alineación institucional de la MA99 ({s_ma99}) y las EMAs rápidas, asegurando un impulso dinámico.
+El RSI en 1h (~{rsi:.1f}) marca un punto de entrada óptimo tras un retroceso sano, propicio para capturar el movimiento amplio.
 La zona de entrada entre {s_entry_min} y {s_entry_max} optimiza el riesgo/beneficio con un Stop Loss técnico en {s_sl}.
-La volatilidad del ATR (~{s_atr}) confirma actividad ideal para capturar TP1 rápidamente.
+La volatilidad del ATR (~{s_atr}) confirma el rango necesario para buscar los objetivos extendidos.
 
 ⚠️ Mantener estricta disciplina en {s_sl}.
 
-Sesgo: {'Continuidad alcista de corto plazo.' if direction == 'LONG' else 'Continuidad bajista de corto plazo.'}
+Sesgo: {'Continuidad alcista ampliada.' if direction == 'LONG' else 'Continuidad bajista ampliada.'}
 
 This message was sent automatically with GitHub Actions"""
 
         await send_telegram_message(session, message)
-        print(f"¡Alerta de alta efectividad enviada para {coin_name}!")
+        print(f"¡Alerta ampliada enviada para {coin_name}!")
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+            
