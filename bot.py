@@ -1,6 +1,8 @@
 import os
 import time
 import asyncio
+import json
+from datetime import datetime, timezone, timedelta
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
@@ -11,6 +13,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = '1h'
 LIMIT_CANDLES = 120
+COOLDOWN_HOURS = 4  # Horas que una moneda debe esperar antes de recibir otra señal
+HISTORIAL_FILE = "historial_senales.json"
+
+def cargar_historial():
+    if os.path.exists(HISTORIAL_FILE):
+        try:
+            with open(HISTORIAL_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def guardar_historial(historial):
+    try:
+        with open(HISTORIAL_FILE, "w") as f:
+            json.dump(historial, f, indent=4)
+    except Exception as e:
+        print(f"Error al guardar el historial: {e}")
 
 async def send_telegram_message(session, message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -59,10 +79,8 @@ async def analizar_par(exchange, symbol, semaphore):
                 return None
 
             direction = None
-            # LONG: Precio > MA99 y RSI <= 45.0
             if current_price > ma99 and rsi <= 45.0:
                 direction = 'LONG'
-            # SHORT: Precio < MA99 y RSI >= 55.0
             elif current_price < ma99 and rsi >= 55.0:
                 direction = 'SHORT'
 
@@ -105,7 +123,7 @@ async def main():
     exchange.options['fetchMarkets'] = ['spot']
 
     try:
-        print("Cargando mercados Spot de Binance a través de binance.vision (async)...")
+        print("Cargando mercados Spot de Binance...")
         markets = await exchange.fetch_markets()
         lista_pares = [m['symbol'] for m in markets if m['quote'] == 'USDT' and m['active']]
         
@@ -119,7 +137,7 @@ async def main():
         return
 
     print(f"¡Mercados cargados! Total pares USDT: {len(lista_pares)}")
-    print(f"Escaneando mercados de forma concurrente en temporalidad de {TIMEFRAME}...")
+    print(f"Escaneando mercados en temporalidad de {TIMEFRAME}...")
     
     semaphore = asyncio.Semaphore(15)
     tasks = [analizar_par(exchange, symbol, semaphore) for symbol in lista_pares[:150]]
@@ -133,11 +151,35 @@ async def main():
         print("No se encontraron señales en este ciclo.")
         return
 
-    # REGLA: Ordenar por volumen y seleccionar estrictamente LA MEJOR (1 sola opción por hora)
-    potential_signals = sorted(potential_signals, key=lambda x: x['volume'], reverse=True)
-    best_signal = potential_signals[0]
+    # --- FILTRO DE COOLDOWN ---
+    historial = cargar_historial()
+    ahora = datetime.now(timezone.utc)
+    
+    # Limpiar monedas expiradas del historial y filtrar las que estén en cooldown
+    pares_filtrados = []
+    for sig in potential_signals:
+        sym = sig['symbol']
+        if sym in historial:
+            tiempo_ultima = datetime.fromisoformat(historial[sym])
+            # Si aún está dentro de las 4 horas de descanso, se omite
+            if ahora - tiempo_ultima < timedelta(hours=COOLDOWN_HOURS):
+                print(f"Moneda {sym} en Cooldown (ignorada temporalmente).")
+                continue
+        pares_filtrados.append(sig)
 
-    print(f"Se seleccionó la mejor opción: {best_signal['symbol']}. Enviando alerta única...")
+    if not pares_filtrados:
+        print("Hay señales pero todas están en período de Cooldown.")
+        return
+
+    # Ordenar por volumen de los pares que sí pasaron el cooldown
+    pares_filtrados = sorted(pares_filtrados, key=lambda x: x['volume'], reverse=True)
+    best_signal = pares_filtrados[0]
+
+    # Registrar esta moneda en el historial con la hora actual
+    historial[best_signal['symbol']] = ahora.isoformat()
+    guardar_historial(historial)
+
+    print(f"Se seleccionó la mejor opción fuera de cooldown: {best_signal['symbol']}. Enviando alerta...")
 
     async with aiohttp.ClientSession() as session:
         sig = best_signal
@@ -150,13 +192,15 @@ async def main():
         
         coin_name = symbol.split('/')[0]
         
-        # Formato visual de Compra/Venta con color
         if direction == 'LONG':
             action_label = "LONG - COMPRA 🟢"
         else:
             action_label = "SHORT - VENTA 🔴"
 
-        # --- DECIMALES DINÁMICOS Y BLINDAJE DE ATR ULTRA-PRECISOS ---
+        min_atr = current_price * 0.005
+        if atr < min_atr:
+            atr = min_atr
+
         if current_price < 0.0001:
             decimals = 8
         elif current_price < 0.01:
@@ -167,12 +211,6 @@ async def main():
             decimals = 2
 
         fmt = f"{{:.{decimals}f}}"
-
-        # Blindaje absoluto del ATR para evitar que dé cero en monedas de fracciones microscópicas
-        min_atr = current_price * 0.005
-        if atr < min_atr or atr == 0:
-            atr = max(min_atr, 1e-8)
-
         leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
 
         if direction == 'LONG':
@@ -231,4 +269,4 @@ This message was sent automatically with GitHub Actions"""
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+            
