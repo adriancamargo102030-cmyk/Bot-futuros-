@@ -133,7 +133,7 @@ async def main():
         print("No se encontraron señales en este ciclo.")
         return
 
-    # REGLA NUEVA: Ordenar por volumen y seleccionar estrictamente LA MEJOR (1 sola opción por hora)
+    # REGLA: Ordenar por volumen y seleccionar estrictamente LA MEJOR (1 sola opción por hora)
     potential_signals = sorted(potential_signals, key=lambda x: x['volume'], reverse=True)
     best_signal = potential_signals[0]
 
@@ -156,13 +156,10 @@ async def main():
         else:
             action_label = "SHORT - VENTA 🔴"
 
-        # Blindaje ATR
-        min_atr = current_price * 0.005
-        if atr < min_atr:
-            atr = min_atr
-
-        # Decimales dinámicos
-        if current_price < 0.01:
+        # --- DECIMALES DINÁMICOS Y BLINDAJE DE ATR ULTRA-PRECISOS ---
+        if current_price < 0.0001:
+            decimals = 8
+        elif current_price < 0.01:
             decimals = 6
         elif current_price < 1.0:
             decimals = 4
@@ -170,6 +167,11 @@ async def main():
             decimals = 2
 
         fmt = f"{{:.{decimals}f}}"
+
+        # Blindaje absoluto del ATR para evitar que dé cero en monedas de fracciones microscópicas
+        min_atr = current_price * 0.005
+        if atr < min_atr or atr == 0:
+            atr = max(min_atr, 1e-8)
 
         leverage = "x3 - x5 (Margen Aislado)" if (atr / current_price) > 0.02 else "x5 - x8 (Margen Aislado)"
 
@@ -229,4 +231,4 @@ This message was sent automatically with GitHub Actions"""
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
